@@ -42,7 +42,7 @@ UPDATE_PACKAGE() {
 # UPDATE_PACKAGE "package name" "GitHub repo" "branch" "pkg/name("pkg" is to extract from collection; "name" is to rename the package name)" "package(s) to remove"
 UPDATE_PACKAGE "momo" "nikkinikki-org/OpenWrt-momo" "main"
 UPDATE_PACKAGE "qmodem" "FUjr/QModem" "main"
-UPDATE_PACKAGE "luci-theme-bootstrap" "hbend1li/luci-theme-bootstrap" "main"
+# UPDATE_PACKAGE "luci-theme-bootstrap" "hbend1li/luci-theme-bootstrap" "main"
 
 # update package(s) version
 UPDATE_VERSION() {
