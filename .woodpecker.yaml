@@ -1,0 +1,340 @@
+when:
+  - event: [push, manual, cron]
+    branch: [main, master]
+  - event: tag
+
+matrix:
+  include:
+    - CONFIG: MEDIATEK
+      BUILD_TYPE: imagebuilder
+      TARGET: mediatek/filogic
+      ARCH: aarch64_cortex-a53
+    - CONFIG: X86_64
+      BUILD_TYPE: imagebuilder
+      TARGET: x86/64
+      ARCH: x86_64
+    - CONFIG: IPQ60XX-WIFI
+      BUILD_TYPE: source
+      TARGET: qualcommax
+      SOURCE: VIKINGYFY/immortalwrt
+      BRANCH: main
+    - CONFIG: IPQ807X-WIFI
+      BUILD_TYPE: source
+      TARGET: qualcommax
+      SOURCE: VIKINGYFY/immortalwrt
+      BRANCH: main
+
+steps:
+  - name: build
+    image: ubuntu:22.04
+    environment:
+      WRT_NAME: ImmortalWRT
+      WRT_SSID: ImmortalWRT
+      WRT_NETPW: "12345678"
+      WRT_IP: 192.168.1.1
+      WRT_PACKAGE: ""
+      IB_IGNORE: "cpufreq nand-utils kmod-mtd-rw"
+      IB_SNAPSHOT_EXCLUDES: "-automount -mtd"
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - |
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        export FORCE_UNSAFE_CONFIGURE=1
+        export FORCE=1
+        CI_WORKSPACE="$${CI_WORKSPACE:-$PWD}"
+        WRT_DATE=$$(TZ=UTC-8 date +"%y.%m.%d_%H.%M.%S")
+
+        ln -sf /usr/share/zoneinfo/Asia/Hong_Kong /etc/localtime
+        echo "Asia/Hong_Kong" > /etc/timezone
+
+        mkdir -p "$$CI_WORKSPACE/upload"
+
+        if [ "${BUILD_TYPE}" = "imagebuilder" ]; then
+          echo "=== [ImageBuilder] Building ${CONFIG} (${TARGET}) ==="
+
+          apt-get update -yqq
+          apt-get install -yqq build-essential libncurses5-dev zlib1g-dev gawk \
+            git gettext libssl-dev xsltproc rsync wget unzip zstd dos2unix jq \
+            qemu-utils genisoimage curl ca-certificates
+          command -v mkisofs >/dev/null || ln -sf "$$(command -v genisoimage)" /usr/local/bin/mkisofs
+
+          IB_URL="https://downloads.immortalwrt.org/snapshots/targets/${TARGET}"
+          echo "Fetching ImageBuilder from $$IB_URL..."
+          IB_FILE=$$(wget -qO- "$$IB_URL/" | grep -oP 'immortalwrt-imagebuilder[^"]+\.tar\.zst' | head -n1)
+          [ -n "$$IB_FILE" ] || { echo "Error: Unable to locate ImageBuilder archive"; exit 1; }
+
+          wget -q "$$IB_URL/$$IB_FILE" -O ib.tar.zst
+          tar --zstd -xf ib.tar.zst
+          mv immortalwrt-imagebuilder-* ib
+          cd ib
+
+          mkdir -p files/etc/apk/keys files/etc/apk/repositories.d
+          CUSTOM="$$CI_WORKSPACE/config/CUSTOM-FEEDS.txt"
+          if [ -f "$$CUSTOM" ]; then
+            grep -vE '^\s*(#|$$)' "$$CUSTOM" | while IFS='|' read -r NAME URL PUBKEY; do
+              URL=$$(echo "$$URL" | sed "s/{arch}/${ARCH}/g")
+              PUBKEY=$$(echo "$$PUBKEY" | sed "s/{arch}/${ARCH}/g")
+              if [ -n "$$PUBKEY" ]; then
+                wget -qO "keys/$$NAME.pem" "$$PUBKEY" || echo "warn: $$NAME key fetch failed"
+                cp -f "keys/$$NAME.pem" "files/etc/apk/keys/$$NAME.pem"
+              fi
+              echo "$$URL/packages.adb" >> ./repositories
+              echo "$$URL/packages.adb" >> files/etc/apk/repositories.d/customfeeds.list
+            done
+          fi
+
+          SB_AUTH=""
+          [ -n "$$GITHUB_TOKEN" ] && SB_AUTH="-H Authorization:\ Bearer\ $$GITHUB_TOKEN"
+          SB_VER=$$(curl -sL $$SB_AUTH https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | grep -oP '"tag_name":\s*"v?\K[^"]+')
+          if [ -n "$$SB_VER" ]; then
+            wget -qO /tmp/sing-box.apk \
+              "https://github.com/SagerNet/sing-box/releases/download/v$${SB_VER}/sing-box_$${SB_VER}_openwrt_${ARCH}.apk"
+            SB_NAME=$$(./staging_dir/host/bin/apk adbdump /tmp/sing-box.apk | grep -m1 -oP '^\s*name:\s*\K\S+')
+            SB_PKGVER=$$(./staging_dir/host/bin/apk adbdump /tmp/sing-box.apk | grep -m1 -oP '^\s*version:\s*\K\S+')
+            mv /tmp/sing-box.apk "packages/$${SB_NAME}-$${SB_PKGVER}.apk"
+          fi
+
+          CFG="$$CI_WORKSPACE/config"
+          grep -hoP '^CONFIG_PACKAGE_\K[^=]+(?==y)' "$$CFG/GENERAL.txt" "$$CFG/${CONFIG}.txt" 2>/dev/null | sort -u > /tmp/pkgs.txt
+          grep -hoP '^CONFIG_PACKAGE_\K[^=]+(?==n)' "$$CFG/GENERAL.txt" "$$CFG/${CONFIG}.txt" 2>/dev/null | sort -u > /tmp/pkgs_no.txt
+          comm -23 /tmp/pkgs.txt /tmp/pkgs_no.txt > /tmp/pkgs2.txt && mv /tmp/pkgs2.txt /tmp/pkgs.txt
+          for P in $$IB_IGNORE; do sed -i "\|^$$P$$|d" /tmp/pkgs.txt; done
+          if grep -q '^kmod-usb-net-rtl8152$$' /tmp/pkgs.txt; then
+            echo "-kmod-usb-net-rtl8152-vendor" >> /tmp/pkgs.txt
+          fi
+          if [ -n "$$WRT_PACKAGE" ]; then
+            echo -e "$$WRT_PACKAGE" | sed -E 's/CONFIG_PACKAGE_//g; s/=y//g' | tr ' ' '\n' >> /tmp/pkgs.txt
+          fi
+          echo "sing-box" >> /tmp/pkgs.txt
+          for P in $$IB_SNAPSHOT_EXCLUDES; do echo "$$P" >> /tmp/pkgs.txt; done
+          PKGS=$$(grep -vE '^\s*$$' /tmp/pkgs.txt | sort -u | tr '\n' ' ')
+
+          FILES="files"
+          mkdir -p "$$FILES/etc/uci-defaults"
+          cat > "$$FILES/etc/uci-defaults/99-custom-settings" << 'EOF'
+          #!/bin/sh
+          uci -q batch <<-UCI
+            set system.@system[0].hostname='__WRT_NAME__'
+            set network.lan.ipaddr='__WRT_IP__'
+          UCI
+          for dev in $(uci -q show wireless | grep -oE 'wireless\.[^.]+=wifi-iface' | cut -d. -f2 | cut -d= -f1); do
+            uci -q set wireless.$dev.ssid='__WRT_SSID__'
+            uci -q set wireless.$dev.key='__WRT_NETPW__'
+            uci -q set wireless.$dev.encryption='psk2'
+          done
+          uci -q commit
+          exit 0
+          EOF
+          sed -i "s/__WRT_NAME__/$$WRT_NAME/g; s/__WRT_IP__/$$WRT_IP/g; s/__WRT_SSID__/$$WRT_SSID/g; s/__WRT_NETPW__/$$WRT_NETPW/g" "$$FILES/etc/uci-defaults/99-custom-settings"
+          chmod +x "$$FILES/etc/uci-defaults/99-custom-settings"
+
+          TARGET_SLUG=$$(echo "${TARGET}" | tr '/' '_')
+          PROFILES=$$(grep -oP "DEVICE_$${TARGET_SLUG}_DEVICE_\K[^=]+" "$$CFG/${CONFIG}.txt" | sort -u)
+          [ -z "$$PROFILES" ] && PROFILES="generic"
+          PARTSIZE=$$(grep -oP '^CONFIG_TARGET_ROOTFS_PARTSIZE=\K\d+' "$$CFG/${CONFIG}.txt" || true)
+
+          EXTRA_ARGS=""
+          [ -n "$$PARTSIZE" ] && EXTRA_ARGS="ROOTFS_PARTSIZE=$$PARTSIZE"
+
+          for P in $$PROFILES; do
+            echo "--- Building profile: $$P ---"
+            make image PROFILE="$$P" PACKAGES="$$PKGS" FILES="files" $$EXTRA_ARGS \
+              || make image PROFILE="$$P" PACKAGES="$$PKGS" FILES="files" $$EXTRA_ARGS V=s \
+              || echo "Profile $$P failed, skipping"
+          done
+
+          find bin/targets/ -type f \( -name "*.bin" -o -name "*.img.gz" -o -name "*.vmdk" -o -name "*.qcow2" -o -name "*.vdi" -o -name "*.vhdx" -o -name "*.iso" -o -name "*.itb" -o -name "*sysupgrade*" -o -name "*factory*" -o -name "*.manifest" \) \
+            -exec cp -f {} "$$CI_WORKSPACE/upload/" \;
+
+        else
+          echo "=== [Source Compile] Building ${CONFIG} (${SOURCE}@${BRANCH}) ==="
+
+          apt-get update -yqq
+          apt-get install -yqq curl ca-certificates jq dos2unix libfuse-dev git rsync sudo
+          bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)
+
+          CFG="$$CI_WORKSPACE/config"
+          WRT_REPO="https://github.com/${SOURCE}.git"
+          WRT_VER=$$(echo "$$WRT_REPO" | cut -d '/' -f 5-)-"${BRANCH}"
+          SRC_TARGET=$$(grep -m 1 -oP '^CONFIG_TARGET_\K[\w]+(?=\=y)' "$$CFG/${CONFIG}.txt" | tr '[:lower:]' '[:upper:]')
+
+          git clone --depth=1 --single-branch --branch "${BRANCH}" "$$WRT_REPO" ./wrt
+          cd ./wrt
+
+          [ -f "./scripts/projectsmirrors.json" ] && sed -i '/.cn\//d; /tencent/d; /aliyun/d' "./scripts/projectsmirrors.json"
+
+          if [ "${CONFIG}" = "IPQ60XX-WIFI" ]; then
+            IPQ60XX_IMAGE_MK="./target/linux/qualcommax/image/ipq60xx.mk"
+            [ -f "$$IPQ60XX_IMAGE_MK" ] && sed -i -E '/^TARGET_DEVICES \+= glinet_gl-(ax1800|axt1800)$/d' "$$IPQ60XX_IMAGE_MK"
+          fi
+
+          find ./ -maxdepth 3 -type f -iregex ".*\(txt\|sh\)$" -exec dos2unix {} \; -exec chmod +x {} \;
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          cat "$$CFG/${CONFIG}.txt" "$$CFG/GENERAL.txt" >> .config
+          [ -n "$$WRT_PACKAGE" ] && echo -e "$$WRT_PACKAGE" >> .config
+
+          make defconfig -j$$(nproc) && make clean -j$$(nproc)
+
+          ARCH=$$(grep -oP 'CONFIG_TARGET_ARCH_PACKAGES="\K[^"]+' .config)
+          mkdir -p files/etc/uci-defaults files/etc/apk/keys files/etc/apk/repositories.d files/etc/prebuilt
+
+          cat > files/etc/uci-defaults/99-custom-settings << 'EOF'
+          #!/bin/sh
+          uci -q batch <<-UCI
+            set system.@system[0].hostname='__WRT_NAME__'
+            set network.lan.ipaddr='__WRT_IP__'
+          UCI
+          for dev in $(uci -q show wireless | grep -oE 'wireless\.[^.]+=wifi-iface' | cut -d. -f2 | cut -d= -f1); do
+            uci -q set wireless.$dev.ssid='__WRT_SSID__'
+            uci -q set wireless.$dev.key='__WRT_NETPW__'
+            uci -q set wireless.$dev.encryption='psk2'
+          done
+          uci -q commit
+          exit 0
+          EOF
+          sed -i "s/__WRT_NAME__/$$WRT_NAME/g; s/__WRT_IP__/$$WRT_IP/g; s/__WRT_SSID__/$$WRT_SSID/g; s/__WRT_NETPW__/$$WRT_NETPW/g" files/etc/uci-defaults/99-custom-settings
+          chmod +x files/etc/uci-defaults/99-custom-settings
+
+          CUSTOM="$$CFG/CUSTOM-FEEDS.txt"
+          if [ -f "$$CUSTOM" ]; then
+            grep -vE '^\s*(#|$$)' "$$CUSTOM" | while IFS='|' read -r NAME URL PUBKEY; do
+              URL=$$(echo "$$URL" | sed "s/{arch}/$$ARCH/g")
+              PUBKEY=$$(echo "$$PUBKEY" | sed "s/{arch}/$$ARCH/g")
+              [ -n "$$PUBKEY" ] && wget -qO "files/etc/apk/keys/$$NAME.pem" "$$PUBKEY"
+              echo "$$URL/packages.adb" >> files/etc/apk/repositories.d/customfeeds.list
+              for APK in $$(curl -sL "$$URL/index.json" | python3 -c "import json,sys; print('\n'.join(f'{n}-{v}.apk' for n,v in json.load(sys.stdin)['packages'].items()))"); do
+                wget -qO "files/etc/prebuilt/$$APK" "$$URL/$$APK"
+              done
+            done
+          fi
+
+          SB_AUTH=""
+          [ -n "$$GITHUB_TOKEN" ] && SB_AUTH="-H Authorization:\ Bearer\ $$GITHUB_TOKEN"
+          SB_VER=$$(curl -sL $$SB_AUTH https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | grep -oP '"tag_name":\s*"v?\K[^"]+')
+          if [ -n "$$SB_VER" ]; then
+            wget -qO "files/etc/prebuilt/sing-box_$${SB_VER}_$${ARCH}.apk" \
+              "https://github.com/SagerNet/sing-box/releases/download/v$${SB_VER}/sing-box_$${SB_VER}_openwrt_$${ARCH}.apk"
+          fi
+
+          cat > files/etc/uci-defaults/98-install-prebuilt << 'EOF'
+          #!/bin/sh
+          [ -d /etc/prebuilt ] || exit 0
+          set -- /etc/prebuilt/*.apk
+          [ -e "$1" ] || { rm -rf /etc/prebuilt; exit 0; }
+          if apk add --allow-untrusted "$@"; then
+            rm -rf /etc/prebuilt
+            exit 0
+          fi
+          exit 1
+          EOF
+          chmod +x files/etc/uci-defaults/98-install-prebuilt
+
+          make download -j$$(nproc)
+          make -j$$(nproc) || make -j1 V=s
+
+          cp -f ./.config "$$CI_WORKSPACE/upload/config_${CONFIG}_$${WRT_VER}_$${WRT_DATE}.txt"
+          find ./bin/targets/ -iregex ".*\(buildinfo\|json\|sha256sums\|packages\)$" -exec rm -rf {} +
+
+          for FILE in $$(find ./bin/targets/ -type f -iname "*$$SRC_TARGET*"); do
+            EXT=$$(basename "$$FILE" | cut -d '.' -f 2-)
+            NAME=$$(basename "$$FILE" | cut -d '.' -f 1 | grep -io "\($$SRC_TARGET\).*")
+            NEW_FILE="$${WRT_VER}_$${NAME}_$${WRT_DATE}.$${EXT}"
+            mv -f "$$FILE" "$$CI_WORKSPACE/upload/$$NEW_FILE"
+          done
+
+          find ./bin/targets/ -type f -exec mv -f {} "$$CI_WORKSPACE/upload/" \;
+        fi
+
+        echo "=== Output Images ==="
+        ls -la "$$CI_WORKSPACE/upload/"
+        [ -n "$$(ls -A "$$CI_WORKSPACE/upload/")" ] || { echo "Error: No images produced"; exit 1; }
+
+  - name: release
+    image: ubuntu:22.04
+    environment:
+      CODEBERG_TOKEN:
+        from_secret: codeberg_token
+    commands:
+      - |
+        set -e
+        if [ -z "$$CODEBERG_TOKEN" ]; then
+          echo "Notice: CODEBERG_TOKEN not configured. Skipping release publication."
+          exit 0
+        fi
+
+        CI_WORKSPACE="$${CI_WORKSPACE:-$PWD}"
+        if [ -z "$$(ls -A "$$CI_WORKSPACE/upload" 2>/dev/null)" ]; then
+          echo "Error: upload directory is empty, nothing to release."
+          exit 1
+        fi
+
+        apt-get update -yqq && apt-get install -yqq curl jq ca-certificates
+
+        FORGE_URL="$${CI_FORGE_URL:-https://codeberg.org}"
+        API_URL="$$FORGE_URL/api/v1/repos/$$CI_REPO"
+        AUTH_HEADER="Authorization: token $$CODEBERG_TOKEN"
+        WRT_DATE=$$(TZ=UTC-8 date +"%y.%m.%d_%H.%M.%S")
+
+        echo "Checking release for tag '${CONFIG}' on $$CI_REPO..."
+        REL_INFO=$$(curl -s -H "$$AUTH_HEADER" "$$API_URL/releases/tags/${CONFIG}")
+        REL_ID=$$(echo "$$REL_INFO" | jq -r '.id // empty')
+
+        RELEASE_BODY="### ImmortalWRT Firmware - ${CONFIG}
+
+        - **Platform:** ${CONFIG} (${TARGET})
+        - **Build Type:** ${BUILD_TYPE}
+        - **Build Date:** $$WRT_DATE
+        - **Built by:** Woodpecker CI on Codeberg
+        "
+
+        if [ -n "$$REL_ID" ]; then
+          echo "Existing release found (ID: $$REL_ID). Updating release body..."
+          curl -s -X PATCH "$$API_URL/releases/$$REL_ID" \
+            -H "$$AUTH_HEADER" \
+            -H "Content-Type: application/json" \
+            -d "{\"body\": $$(echo "$$RELEASE_BODY" | jq -Rs .)}" >/dev/null
+
+          echo "Removing old release assets..."
+          curl -s -H "$$AUTH_HEADER" "$$API_URL/releases/$$REL_ID/assets" \
+            | jq -r '.[].id // empty' | while read -r ASSET_ID; do
+              [ -n "$$ASSET_ID" ] && curl -s -X DELETE -H "$$AUTH_HEADER" "$$API_URL/releases/$$REL_ID/assets/$$ASSET_ID" >/dev/null
+            done
+        else
+          echo "Creating new release for tag '${CONFIG}'..."
+          CREATE_RES=$$(curl -s -X POST "$$API_URL/releases" \
+            -H "$$AUTH_HEADER" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"tag_name\": \"${CONFIG}\",
+              \"name\": \"${CONFIG}\",
+              \"body\": $$(echo "$$RELEASE_BODY" | jq -Rs .),
+              \"draft\": false,
+              \"prerelease\": false
+            }")
+          REL_ID=$$(echo "$$CREATE_RES" | jq -r '.id // empty')
+        fi
+
+        if [ -z "$$REL_ID" ]; then
+          echo "Error: Could not retrieve or create Release ID."
+          exit 1
+        fi
+
+        echo "Uploading artifacts to release '${CONFIG}' (ID: $$REL_ID)..."
+        for FILE in "$$CI_WORKSPACE"/upload/*; do
+          [ -f "$$FILE" ] || continue
+          FILENAME=$$(basename "$$FILE")
+          echo "Uploading $$FILENAME..."
+          curl -s -X POST \
+            "$$API_URL/releases/$$REL_ID/assets?name=$$FILENAME" \
+            -H "$$AUTH_HEADER" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@$$FILE" >/dev/null
+        done
+        echo "Release '${CONFIG}' published successfully!"
