@@ -1,0 +1,405 @@
+name: Build ImmortalWRT Firmware
+
+on:
+  schedule:
+    - cron: 0 0 * * 1
+  workflow_dispatch:
+    inputs:
+      PACKAGE:
+        description: 'Add packages manually, separate by \n'
+        required: false
+        type: string
+
+permissions: write-all
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  WRT_NAME: ImmortalWRT
+  WRT_SSID: ImmortalWRT
+  WRT_NETPW: "12345678"
+  WRT_IP: 192.168.1.1
+  WRT_PACKAGE: ${{ inputs.PACKAGE }}
+  IB_IGNORE: "cpufreq nand-utils kmod-mtd-rw"
+  IB_SNAPSHOT_EXCLUDES: "-automount -mtd"
+
+jobs:
+  auto_clean:
+    name: Clean Old Releases & Workflows
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Delete old Releases and Workflows
+        uses: ophub/delete-releases-workflows@main
+        continue-on-error: true
+        with:
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          delete_releases: true
+          releases_keep_latest: 0
+          delete_tags: true
+          delete_workflows: true
+          workflows_keep_day: 0
+
+      - name: Checkout Projects
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      - name: Clean Cache
+        continue-on-error: true
+        run: gh cache delete --all || true
+
+  imagebuilder:
+    name: Build IB ${{ matrix.CONFIG }}
+    needs: auto_clean
+    if: always()
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - CONFIG: MEDIATEK
+            TARGET: mediatek/filogic
+            ARCH: aarch64_cortex-a53
+          - CONFIG: X86_64
+            TARGET: x86/64
+            ARCH: x86_64
+    steps:
+      - name: Checkout Projects
+        uses: actions/checkout@v4
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt -yqq update
+          sudo -E apt -yqq install build-essential libncurses5-dev zlib1g-dev gawk \
+            git gettext libssl-dev xsltproc rsync wget unzip zstd dos2unix jq \
+            qemu-utils genisoimage
+          command -v mkisofs >/dev/null || sudo ln -sf "$(command -v genisoimage)" /usr/local/bin/mkisofs
+          sudo -E timedatectl set-timezone "Asia/Hong_Kong"
+
+      - name: Initialization Values
+        run: |
+          echo "WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d_%H.%M.%S")" >> $GITHUB_ENV
+          echo "IB_URL=https://downloads.immortalwrt.org/snapshots/targets/${{ matrix.TARGET }}" >> $GITHUB_ENV
+
+      - name: Download ImageBuilder
+        run: |
+          IB_FILE=$(wget -qO- "$IB_URL/" | grep -oP 'immortalwrt-imagebuilder[^"]+\.tar\.zst' | head -n1)
+          echo "Downloading $IB_FILE..."
+          wget -q "$IB_URL/$IB_FILE" -O ib.tar.zst
+          tar --zstd -xf ib.tar.zst
+          mv immortalwrt-imagebuilder-* ib
+          echo "ImageBuilder ready"
+
+      - name: Add Custom Feeds
+        run: |
+          cd ib
+          mkdir -p files/etc/apk/keys files/etc/apk/repositories.d
+
+          CUSTOM="$GITHUB_WORKSPACE/config/CUSTOM-FEEDS.txt"
+          if [ -f "$CUSTOM" ]; then
+            grep -vE '^\s*(#|$)' "$CUSTOM" | while IFS='|' read -r NAME URL PUBKEY; do
+              URL=$(echo "$URL" | sed "s/{arch}/${{ matrix.ARCH }}/g")
+              PUBKEY=$(echo "$PUBKEY" | sed "s/{arch}/${{ matrix.ARCH }}/g")
+              if [ -n "$PUBKEY" ]; then
+                wget -qO "keys/$NAME.pem" "$PUBKEY" || echo "warn: $NAME key fetch failed"
+                cp -f "keys/$NAME.pem" "files/etc/apk/keys/$NAME.pem"
+              fi
+              echo "$URL/packages.adb" >> ./repositories
+              echo "$URL/packages.adb" >> files/etc/apk/repositories.d/customfeeds.list
+              echo "Feed added: $NAME -> $URL"
+            done
+          fi
+
+      - name: Add Prebuilt Packages
+        run: |
+          cd ib
+          SB_VER=$(curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | grep -oP '"tag_name":\s*"v?\K[^"]+')
+          wget -qO /tmp/sing-box.apk \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box_${SB_VER}_openwrt_${{ matrix.ARCH }}.apk"
+          SB_NAME=$(./staging_dir/host/bin/apk adbdump /tmp/sing-box.apk | grep -m1 -oP '^\s*name:\s*\K\S+')
+          SB_PKGVER=$(./staging_dir/host/bin/apk adbdump /tmp/sing-box.apk | grep -m1 -oP '^\s*version:\s*\K\S+')
+          mv /tmp/sing-box.apk "packages/${SB_NAME}-${SB_PKGVER}.apk"
+          echo "Added to local feed: ${SB_NAME}-${SB_PKGVER}.apk"
+
+      - name: Compute Package List
+        run: |
+          CFG="$GITHUB_WORKSPACE/config"
+
+          grep -hoP '^CONFIG_PACKAGE_\K[^=]+(?==y)' "$CFG/GENERAL.txt" "$CFG/${{ matrix.CONFIG }}.txt" 2>/dev/null | sort -u > /tmp/pkgs.txt
+          grep -hoP '^CONFIG_PACKAGE_\K[^=]+(?==n)' "$CFG/GENERAL.txt" "$CFG/${{ matrix.CONFIG }}.txt" 2>/dev/null | sort -u > /tmp/pkgs_no.txt
+          comm -23 /tmp/pkgs.txt /tmp/pkgs_no.txt > /tmp/pkgs2.txt && mv /tmp/pkgs2.txt /tmp/pkgs.txt
+
+          for P in $IB_IGNORE; do sed -i "\|^$P$|d" /tmp/pkgs.txt; done
+
+          if grep -q '^kmod-usb-net-rtl8152$' /tmp/pkgs.txt; then
+            echo "-kmod-usb-net-rtl8152-vendor" >> /tmp/pkgs.txt
+          fi
+
+          if [ -n "$WRT_PACKAGE" ]; then
+            echo -e "$WRT_PACKAGE" | sed -E 's/CONFIG_PACKAGE_//g; s/=y//g' | tr ' ' '\n' >> /tmp/pkgs.txt
+          fi
+
+          echo "sing-box" >> /tmp/pkgs.txt
+
+          for P in $IB_SNAPSHOT_EXCLUDES; do echo "$P" >> /tmp/pkgs.txt; done
+
+          PKGS=$(grep -vE '^\s*$' /tmp/pkgs.txt | sort -u | tr '\n' ' ')
+          echo "WRT_PKGS=$PKGS" >> $GITHUB_ENV
+          echo "=== Packages ==="; echo "$PKGS"
+
+      - name: Prepare Files Overlay
+        run: |
+          FILES="ib/files"
+          mkdir -p "$FILES/etc/uci-defaults"
+
+          cat > "$FILES/etc/uci-defaults/99-custom-settings" <<EOF
+          #!/bin/sh
+          uci -q batch <<-UCI
+            set system.@system[0].hostname='$WRT_NAME'
+            set network.lan.ipaddr='$WRT_IP'
+          UCI
+          for dev in \$(uci -q show wireless | grep -oE 'wireless\.[^.]+=wifi-iface' | cut -d. -f2 | cut -d= -f1); do
+            uci -q set wireless.\$dev.ssid='$WRT_SSID'
+            uci -q set wireless.\$dev.key='$WRT_NETPW'
+            uci -q set wireless.\$dev.encryption='psk2'
+          done
+          uci -q commit
+          exit 0
+          EOF
+          chmod +x "$FILES/etc/uci-defaults/99-custom-settings"
+
+      - name: Build Images
+        run: |
+          cd ib
+          mkdir -p "$GITHUB_WORKSPACE/upload"
+
+          TARGET_SLUG=$(echo "${{ matrix.TARGET }}" | tr '/' '_')
+          PROFILES=$(grep -oP "DEVICE_${TARGET_SLUG}_DEVICE_\K[^=]+" \
+            "$GITHUB_WORKSPACE/config/${{ matrix.CONFIG }}.txt" | sort -u)
+          [ -z "$PROFILES" ] && PROFILES="generic"
+
+          PARTSIZE=$(grep -oP '^CONFIG_TARGET_ROOTFS_PARTSIZE=\K\d+' \
+            "$GITHUB_WORKSPACE/config/${{ matrix.CONFIG }}.txt" || true)
+
+          echo "Profiles: $PROFILES"
+          FAILED=""
+          for P in $PROFILES; do
+            echo "::group::build $P"
+            make image PROFILE="$P" PACKAGES="$WRT_PKGS" FILES="files" ${PARTSIZE:+ROOTFS_PARTSIZE="$PARTSIZE"} \
+              || make image PROFILE="$P" PACKAGES="$WRT_PKGS" FILES="files" ${PARTSIZE:+ROOTFS_PARTSIZE="$PARTSIZE"} V=s \
+              || { echo "::warning::profile $P failed, skipping"; FAILED="$FAILED $P"; }
+            echo "::endgroup::"
+          done
+          if [ -n "$FAILED" ]; then
+            echo "### Failed profiles" >> $GITHUB_STEP_SUMMARY
+            for P in $FAILED; do echo "- $P" >> $GITHUB_STEP_SUMMARY; done
+          fi
+
+          find bin/targets/ -type f \( -name "*.bin" -o -name "*.img.gz" -o -name "*.vmdk" -o -name "*.qcow2" -o -name "*.vdi" -o -name "*.vhdx" -o -name "*.iso" -o -name "*.itb" -o -name "*sysupgrade*" -o -name "*factory*" -o -name "*.manifest" \) \
+            -exec cp -f {} "$GITHUB_WORKSPACE/upload/" \;
+          ls -la "$GITHUB_WORKSPACE/upload/"
+          [ -n "$(ls -A "$GITHUB_WORKSPACE/upload/")" ] || { echo "::error::no images produced at all"; exit 1; }
+
+      - name: Release Firmware
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ matrix.CONFIG }}
+          files: ./upload/*.*
+          body: |
+            Platform: ${{ matrix.CONFIG }} (${{ matrix.TARGET }})
+            Built with ImmortalWRT snapshot ImageBuilder
+            Date: ${{ env.WRT_DATE }}
+
+  source_compile:
+    name: Build Source ${{ matrix.CONFIG }}
+    needs: auto_clean
+    if: always()
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - CONFIG: IPQ60XX-WIFI
+            SOURCE: VIKINGYFY/immortalwrt
+            BRANCH: main
+          - CONFIG: IPQ807X-WIFI
+            SOURCE: VIKINGYFY/immortalwrt
+            BRANCH: main
+    steps:
+      - name: Checkout Projects
+        uses: actions/checkout@v4
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt -yqq update
+          sudo -E apt -yqq install dos2unix libfuse-dev
+          sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo -E systemctl daemon-reload
+          sudo -E timedatectl set-timezone "Asia/Hong_Kong"
+
+      - name: Initialization Values
+        run: |
+          echo "WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d_%H.%M.%S")" >> $GITHUB_ENV
+          WRT_REPO="https://github.com/${{ matrix.SOURCE }}.git"
+          echo "WRT_REPO=$WRT_REPO" >> $GITHUB_ENV
+          echo "WRT_VER=$(echo $WRT_REPO | cut -d '/' -f 5-)-${{ matrix.BRANCH }}" >> $GITHUB_ENV
+          echo "WRT_TARGET=$(grep -m 1 -oP '^CONFIG_TARGET_\K[\w]+(?=\=y)' ./config/${{ matrix.CONFIG }}.txt | tr '[:lower:]' '[:upper:]')" >> $GITHUB_ENV
+
+      - name: Clone Code
+        run: |
+          git clone --depth=1 --single-branch --branch ${{ matrix.BRANCH }} $WRT_REPO ./wrt/
+          cd ./wrt/
+          echo "WRT_HASH=$(git log -1 --pretty=format:'%h')" >> $GITHUB_ENV
+
+          # disable China Mainland mirrors
+          if [ -f "./scripts/projectsmirrors.json" ]; then
+            sed -i '/.cn\//d; /tencent/d; /aliyun/d' "./scripts/projectsmirrors.json"
+          fi
+
+          if [ "${{ matrix.CONFIG }}" = "IPQ60XX-WIFI" ]; then
+            IPQ60XX_IMAGE_MK="./target/linux/qualcommax/image/ipq60xx.mk"
+            if [ -f "$IPQ60XX_IMAGE_MK" ]; then
+              sed -i -E '/^TARGET_DEVICES \+= glinet_gl-(ax1800|axt1800)$/d' "$IPQ60XX_IMAGE_MK"
+            fi
+          fi
+
+      - name: Check Scripts
+        run: |
+          find ./ -maxdepth 3 -type f -iregex ".*\(txt\|sh\)$" -exec dos2unix {} \; -exec chmod +x {} \;
+
+      - name: Check Caches
+        id: check-cache
+        uses: actions/cache@v4
+        with:
+          key: ${{ matrix.CONFIG }}-${{ env.WRT_VER }}-${{ env.WRT_HASH }}
+          restore-keys: ${{ matrix.CONFIG }}-${{ env.WRT_VER }}
+          path: |
+            ./wrt/.ccache
+            ./wrt/staging_dir/host*
+            ./wrt/staging_dir/tool*
+
+      - name: Update Caches
+        run: |
+          if [ -d "./wrt/staging_dir" ]; then
+            find "./wrt/staging_dir" -type d -name "stamp" -not -path "*target*" | while read -r DIR; do
+              find "$DIR" -type f -exec touch {} +
+            done
+            mkdir -p ./wrt/tmp && echo "1" > ./wrt/tmp/.build
+            echo "Toolchain skipped done!"
+          else
+            echo "Caches missed!"
+          fi
+
+      - name: Update Feeds
+        run: |
+          cd ./wrt/
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Custom Settings
+        run: |
+          cd ./wrt/
+          cat "$GITHUB_WORKSPACE/config/${{ matrix.CONFIG }}.txt" "$GITHUB_WORKSPACE/config/GENERAL.txt" >> .config
+          [ -n "$WRT_PACKAGE" ] && echo -e "$WRT_PACKAGE" >> .config
+          make defconfig -j$(nproc) && make clean -j$(nproc)
+
+      - name: Custom Files
+        run: |
+          cd ./wrt/
+          ARCH=$(grep -oP 'CONFIG_TARGET_ARCH_PACKAGES="\K[^"]+' .config)
+
+          mkdir -p files/etc/uci-defaults files/etc/apk/keys files/etc/apk/repositories.d files/etc/prebuilt
+
+          cat > files/etc/uci-defaults/99-custom-settings <<EOF
+          #!/bin/sh
+          uci -q batch <<-UCI
+            set system.@system[0].hostname='$WRT_NAME'
+            set network.lan.ipaddr='$WRT_IP'
+          UCI
+          for dev in \$(uci -q show wireless | grep -oE 'wireless\.[^.]+=wifi-iface' | cut -d. -f2 | cut -d= -f1); do
+            uci -q set wireless.\$dev.ssid='$WRT_SSID'
+            uci -q set wireless.\$dev.key='$WRT_NETPW'
+            uci -q set wireless.\$dev.encryption='psk2'
+          done
+          uci -q commit
+          exit 0
+          EOF
+          chmod +x files/etc/uci-defaults/99-custom-settings
+
+          CUSTOM="$GITHUB_WORKSPACE/config/CUSTOM-FEEDS.txt"
+          if [ -f "$CUSTOM" ]; then
+            grep -vE '^\s*(#|$)' "$CUSTOM" | while IFS='|' read -r NAME URL PUBKEY; do
+              URL=$(echo "$URL" | sed "s/{arch}/$ARCH/g")
+              PUBKEY=$(echo "$PUBKEY" | sed "s/{arch}/$ARCH/g")
+              [ -n "$PUBKEY" ] && wget -qO "files/etc/apk/keys/$NAME.pem" "$PUBKEY"
+              echo "$URL/packages.adb" >> files/etc/apk/repositories.d/customfeeds.list
+              for APK in $(curl -sL "$URL/index.json" | python3 -c "import json,sys; print('\n'.join(f'{n}-{v}.apk' for n,v in json.load(sys.stdin)['packages'].items()))"); do
+                wget -qO "files/etc/prebuilt/$APK" "$URL/$APK" && echo "Preloaded: $NAME/$APK"
+              done
+            done
+          fi
+
+          SB_VER=$(curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | grep -oP '"tag_name":\s*"v?\K[^"]+')
+          if [ -n "$SB_VER" ]; then
+            wget -qO "files/etc/prebuilt/sing-box_${SB_VER}_${ARCH}.apk" \
+              "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box_${SB_VER}_openwrt_${ARCH}.apk"
+          fi
+
+          cat > files/etc/uci-defaults/98-install-prebuilt <<'EOF'
+          #!/bin/sh
+          [ -d /etc/prebuilt ] || exit 0
+          set -- /etc/prebuilt/*.apk
+          [ -e "$1" ] || { rm -rf /etc/prebuilt; exit 0; }
+          if apk add --allow-untrusted "$@"; then
+            rm -rf /etc/prebuilt
+            exit 0
+          fi
+          exit 1
+          EOF
+          chmod +x files/etc/uci-defaults/98-install-prebuilt
+
+      - name: Download Packages
+        run: |
+          cd ./wrt/
+          make download -j$(nproc)
+
+      - name: Compile Firmware
+        run: |
+          cd ./wrt/
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Package Firmware
+        run: |
+          cd ./wrt/ && mkdir -p ./upload/
+
+          cp -f ./.config ./upload/config_${{ matrix.CONFIG }}_${WRT_VER}_${WRT_DATE}.txt
+
+          WRT_KVER=$(find ./bin/targets/ -type f -name "*.manifest" -exec grep -oP '^kernel - \K[\d\.]+' {} \; | head -n1)
+          echo "WRT_KVER=$WRT_KVER" >> $GITHUB_ENV
+
+          find ./bin/targets/ -iregex ".*\(buildinfo\|json\|sha256sums\|packages\)$" -exec rm -rf {} +
+
+          for FILE in $(find ./bin/targets/ -type f -iname "*$WRT_TARGET*") ; do
+            EXT=$(basename $FILE | cut -d '.' -f 2-)
+            NAME=$(basename $FILE | cut -d '.' -f 1 | grep -io "\($WRT_TARGET\).*")
+            NEW_FILE="${WRT_VER}_${NAME}_${WRT_DATE}.${EXT}"
+            mv -f $FILE ./upload/$NEW_FILE
+          done
+
+          find ./bin/targets/ -type f -exec mv -f {} ./upload/ \;
+
+      - name: Release Firmware
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ matrix.CONFIG }}
+          files: ./wrt/upload/*.*
+          body: |
+            Platform: ${{ matrix.CONFIG }} (${{ env.WRT_TARGET }})
+            Kernel Version: ${{ env.WRT_KVER }}
+            Date: ${{ env.WRT_DATE }}
