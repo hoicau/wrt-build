@@ -72,7 +72,7 @@ jobs:
           sudo -E apt -yqq update
           sudo -E apt -yqq install build-essential libncurses5-dev zlib1g-dev gawk \
             git gettext libssl-dev xsltproc rsync wget unzip zstd dos2unix jq \
-            qemu-utils genisoimage
+            qemu-utils genisoimage python3 python3-distutils file python-is-python3
           command -v mkisofs >/dev/null || sudo ln -sf "$(command -v genisoimage)" /usr/local/bin/mkisofs
           sudo -E timedatectl set-timezone "Asia/Hong_Kong"
 
@@ -84,8 +84,14 @@ jobs:
       - name: Download ImageBuilder
         run: |
           IB_FILE=$(wget -qO- "$IB_URL/" | grep -oP 'immortalwrt-imagebuilder[^"]+\.tar\.zst' | head -n1)
+          [ -n "$IB_FILE" ] || { echo "Error: Unable to locate ImageBuilder archive"; exit 1; }
+          echo "Located ImageBuilder archive: $IB_FILE"
           echo "Downloading $IB_FILE..."
-          wget -q "$IB_URL/$IB_FILE" -O ib.tar.zst
+          wget -c -t 5 -T 30 --progress=dot:mega "$IB_URL/$IB_FILE" -O ib.tar.zst || {
+            echo "wget failed, trying curl with resume..."
+            curl -fL -C - --retry 5 --retry-delay 5 "$IB_URL/$IB_FILE" -o ib.tar.zst
+          }
+          echo "Extracting ImageBuilder archive..."
           tar --zstd -xf ib.tar.zst
           mv immortalwrt-imagebuilder-* ib
           echo "ImageBuilder ready"
@@ -113,15 +119,24 @@ jobs:
       - name: Add Prebuilt Packages
         run: |
           cd ib
-          SB_VER=$(curl -sL -H "Authorization: Bearer $GITHUB_TOKEN" \
-            https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-            | grep -oP '"tag_name":\s*"v?\K[^"]+')
-          wget -qO /tmp/sing-box.apk \
-            "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box_${SB_VER}_openwrt_${{ matrix.ARCH }}.apk"
-          SB_NAME=$(./staging_dir/host/bin/apk adbdump /tmp/sing-box.apk | grep -m1 -oP '^\s*name:\s*\K\S+')
-          SB_PKGVER=$(./staging_dir/host/bin/apk adbdump /tmp/sing-box.apk | grep -m1 -oP '^\s*version:\s*\K\S+')
-          mv /tmp/sing-box.apk "packages/${SB_NAME}-${SB_PKGVER}.apk"
-          echo "Added to local feed: ${SB_NAME}-${SB_PKGVER}.apk"
+          SB_VER=$(curl -sI https://github.com/SagerNet/sing-box/releases/latest | grep -i '^location:' | grep -oP 'releases/tag/v?\K[^\r\n]+' || true)
+          if [ -z "$SB_VER" ]; then
+            SB_AUTH=""
+            [ -n "$GITHUB_TOKEN" ] && SB_AUTH="-H Authorization:\ Bearer\ $GITHUB_TOKEN"
+            SB_VER=$(curl -sL $SB_AUTH https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+              | grep -oP '"tag_name":\s*"v?\K[^"]+' || true)
+          fi
+          if [ -n "$SB_VER" ]; then
+            echo "Fetching sing-box $SB_VER for ${{ matrix.ARCH }}..."
+            wget -qO /tmp/sing-box.apk \
+              "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box_${SB_VER}_openwrt_${{ matrix.ARCH }}.apk" || true
+            if [ -f /tmp/sing-box.apk ] && [ -s /tmp/sing-box.apk ]; then
+              SB_NAME=$(./staging_dir/host/bin/apk adbdump /tmp/sing-box.apk 2>/dev/null | grep -m1 -oP '^\s*name:\s*\K\S+' || echo "sing-box")
+              SB_PKGVER=$(./staging_dir/host/bin/apk adbdump /tmp/sing-box.apk 2>/dev/null | grep -m1 -oP '^\s*version:\s*\K\S+' || echo "$SB_VER")
+              mv /tmp/sing-box.apk "packages/${SB_NAME}-${SB_PKGVER}.apk"
+              echo "Added to local feed: ${SB_NAME}-${SB_PKGVER}.apk"
+            fi
+          fi
 
       - name: Compute Package List
         run: |
