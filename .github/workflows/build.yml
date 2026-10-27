@@ -143,7 +143,10 @@ jobs:
 
           echo "sing-box" >> /tmp/pkgs.txt
 
-          for P in $IB_SNAPSHOT_EXCLUDES; do echo "$P" >> /tmp/pkgs.txt; done
+          for P in $IB_SNAPSHOT_EXCLUDES; do
+            sed -i "\|^${P#-}\$|d" /tmp/pkgs.txt
+            echo "$P" >> /tmp/pkgs.txt
+          done
 
           PKGS=$(grep -vE '^\s*$' /tmp/pkgs.txt | sort -u | tr '\n' ' ')
           echo "WRT_PKGS=$PKGS" >> $GITHUB_ENV
@@ -203,7 +206,7 @@ jobs:
           [ -n "$(ls -A "$GITHUB_WORKSPACE/upload/")" ] || { echo "::error::no images produced at all"; exit 1; }
 
       - name: Release Firmware
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ matrix.CONFIG }}
           files: ./upload/*.*
@@ -395,7 +398,7 @@ jobs:
           find ./bin/targets/ -type f -exec mv -f {} ./upload/ \;
 
       - name: Release Firmware
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ matrix.CONFIG }}
           files: ./wrt/upload/*.*
